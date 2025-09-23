@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//e/git_repository/AstrBot/data/plugins/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

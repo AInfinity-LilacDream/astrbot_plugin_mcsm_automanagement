@@ -25,6 +25,12 @@ op_list = ["1977741520", "1557758223"]
 add1reply = None
 add1count = 0
 
+# 头像缓存字典，避免重复下载
+avatar_cache = {}
+
+# 用户与玩家昵称绑定字典 {qq_id: minecraft_name}
+player_bindings = {}
+
 @register("mcsm_automanagement", "AInfinity_LilacDream", "MC服务器智能管理群助手", "1.0.0")
 class MyPlugin(Star):
 
@@ -33,6 +39,21 @@ class MyPlugin(Star):
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+        
+    def get_cached_avatar(self, player_name, avatar_url):
+        """获取缓存的头像，如果没有则下载并缓存"""
+        global avatar_cache
+        
+        if player_name in avatar_cache:
+            return avatar_cache[player_name]
+        
+        # 修改头像URL为64x64分辨率（更小）
+        if avatar_url and 'size=128' in avatar_url:
+            avatar_url = avatar_url.replace('size=128', 'size=64')
+        
+        # 缓存头像URL
+        avatar_cache[player_name] = avatar_url
+        return avatar_url
 
     async def getZZKServerInfo(self):
         headers = {
@@ -48,6 +69,14 @@ class MyPlugin(Star):
         }
 
         response = requests.get(zzk_baseURL + "/offline_servers", headers = headers)
+        return response
+
+    async def getPlayerRankData(self):
+        headers = {
+            'x-api-key': zzk_apikey
+        }
+
+        response = requests.get(zzk_baseURL + "/player_rank", headers = headers)
         return response
 
     async def getADServerInfo(self):
@@ -95,6 +124,11 @@ class MyPlugin(Star):
     async def on_all_message(self, event: AstrMessageEvent):
         chain = event.get_messages()
         sender = event.get_sender_id()
+        
+        # 检查消息链是否为空，避免索引越界
+        if not chain or len(chain) == 0:
+            return
+            
         if (chain[0].type == "Poke:poke" and chain[0].qq == int(event.message_obj.self_id)):
             random.seed(time.time())
             randint = random.randint(0, 4)
@@ -116,6 +150,10 @@ class MyPlugin(Star):
                     return
                 
             global add1reply, add1count
+            # 确保chain不为空才进行后续处理
+            if not chain:
+                return
+                
             if add1reply is None or len(chain) != len(add1reply):
                 add1reply = chain
                 add1count = 1
@@ -153,6 +191,131 @@ class MyPlugin(Star):
     def mcstatus(self):
         """获取服务器状态"""
         pass
+
+    @mcstatus.command("rank")
+    async def mcstatusRank(self, event: AstrMessageEvent):
+        """获取zzk服务器玩家在线时长排行榜"""
+
+        response = await self.getPlayerRankData()
+        if response.status_code == 200:
+            data = response.json()
+            
+            # 按今日在线时间排序，只取前5名
+            sorted_players = sorted(data.items(), key=lambda x: x[1].get('today_time', 0), reverse=True)[:5]
+            
+            if not sorted_players:
+                yield event.plain_result("暂无玩家数据。")
+                return
+            
+            # 构建消息链，包含文本和图片
+            message_chain = []
+            message_chain.append(Comp.Plain("📊 今日在线时长排行榜 📊\n"))
+            
+            for idx, (player_name, player_data) in enumerate(sorted_players):
+                # 格式化时间（秒转换为小时分钟）
+                today_seconds = player_data.get('today_time', 0)
+                total_seconds = player_data.get('online_time', 0)
+                
+                today_hours = int(today_seconds // 3600)
+                today_minutes = int((today_seconds % 3600) // 60)
+                
+                total_hours = int(total_seconds // 3600)
+                total_minutes = int((total_seconds % 3600) // 60)
+                
+                # 格式化为中文时间
+                today_time_str = f"{today_hours}小时{today_minutes}分钟" if today_hours > 0 else f"{today_minutes}分钟"
+                total_time_str = f"{total_hours}小时{total_minutes}分钟" if total_hours > 0 else f"{total_minutes}分钟"
+                
+                # 在线状态
+                online_status = "🟢在线" if player_data.get('online', False) else "🔴离线"
+                
+                # 前三名特殊标记
+                if idx == 0:
+                    rank_symbol = "👑"
+                elif idx == 1:
+                    rank_symbol = "🥈"
+                elif idx == 2:
+                    rank_symbol = "🥉"
+                else:
+                    rank_symbol = f"{idx + 1}."
+                
+                # 获取缓存的头像（64x64分辨率）
+                avatar_url = player_data.get('avatar', '')
+                if avatar_url:
+                    cached_avatar = self.get_cached_avatar(player_name, avatar_url)
+                    message_chain.append(Comp.Image(file=cached_avatar))
+                
+                # 添加玩家信息
+                player_info = f"{rank_symbol} {player_name} {online_status}\n"
+                player_info += f"   今日: {today_time_str}\n"
+                player_info += f"   总计: {total_time_str}\n"
+                player_info += "─" * 25 + "\n"
+                
+                message_chain.append(Comp.Plain(player_info))
+            
+            yield event.chain_result(message_chain)
+        else:
+            yield event.plain_result("获取排行榜数据失败，请检查API密钥和URL配置。")
+
+    @mcstatus.command("totalrank")
+    async def mcstatusTotalRank(self, event: AstrMessageEvent):
+        """获取zzk服务器玩家总累计时长卷王排行榜"""
+
+        response = await self.getPlayerRankData()
+        if response.status_code == 200:
+            data = response.json()
+            
+            # 按总累计在线时间排序，只取前5名
+            sorted_players = sorted(data.items(), key=lambda x: x[1].get('online_time', 0), reverse=True)[:5]
+            
+            if not sorted_players:
+                yield event.plain_result("暂无玩家数据。")
+                return
+            
+            # 构建消息链，包含文本和图片
+            message_chain = []
+            message_chain.append(Comp.Plain("🎯 卷王排行榜 🎯\n"))
+            message_chain.append(Comp.Plain("(总累计在线时长)\n"))
+            
+            for idx, (player_name, player_data) in enumerate(sorted_players):
+                # 格式化总累计时间
+                total_seconds = player_data.get('online_time', 0)
+                
+                total_hours = int(total_seconds // 3600)
+                total_minutes = int((total_seconds % 3600) // 60)
+                
+                # 格式化为中文时间
+                total_time_str = f"{total_hours}小时{total_minutes}分钟" if total_hours > 0 else f"{total_minutes}分钟"
+                
+                # 在线状态
+                online_status = "🟢在线" if player_data.get('online', False) else "🔴离线"
+                
+                # 前三名特殊标记
+                if idx == 0:
+                    rank_symbol = "👑"
+                elif idx == 1:
+                    rank_symbol = "🥈"
+                elif idx == 2:
+                    rank_symbol = "🥉"
+                else:
+                    rank_symbol = f"{idx + 1}."
+                
+                # 获取缓存的头像（64x64分辨率）
+                avatar_url = player_data.get('avatar', '')
+                if avatar_url:
+                    cached_avatar = self.get_cached_avatar(player_name, avatar_url)
+                    message_chain.append(Comp.Image(file=cached_avatar))
+                
+                # 添加玩家信息
+                player_info = f"{rank_symbol} {player_name} {online_status}\n"
+                player_info += f"   总计: {total_time_str}\n"
+                player_info += "─" * 25 + "\n"
+                
+                message_chain.append(Comp.Plain(player_info))
+            
+            yield event.chain_result(message_chain)
+        else:
+            yield event.plain_result("获取排行榜数据失败，请检查API密钥和URL配置。")
 
     @mcstatus.command("zzk")
     async def mcstatusZZK(self, event: AstrMessageEvent):
@@ -541,6 +704,87 @@ class MyPlugin(Star):
                 else:
                     op_list.remove(userID)
                     yield event.plain_result(f"撤销了用户 {userID} 给予玩家OP的权限。")
+
+    # player 指令组：玩家个人功能
+    # player bind
+    # player time
+    @filter.command_group("player")
+    def player(self):
+        """玩家个人功能"""
+        pass
+
+    @player.command("bind")
+    async def bindPlayer(self, event: AstrMessageEvent, playerName: str):
+        """绑定Minecraft玩家昵称"""
+        global player_bindings
+        
+        user_id = event.get_sender_id()
+        player_bindings[user_id] = playerName
+        
+        yield event.plain_result(f"成功绑定玩家昵称：{playerName}")
+
+    @player.command("time")
+    async def playerTime(self, event: AstrMessageEvent):
+        """查询个人在线时间"""
+        global player_bindings
+        
+        user_id = event.get_sender_id()
+        
+        # 检查是否已绑定玩家
+        if user_id not in player_bindings:
+            yield event.plain_result("你还没有绑定Minecraft玩家昵称，请先使用 'player bind <玩家名>' 进行绑定。")
+            return
+        
+        player_name = player_bindings[user_id]
+        
+        # 获取玩家数据
+        response = await self.getPlayerRankData()
+        if response.status_code == 200:
+            data = response.json()
+            
+            # 查找绑定的玩家数据
+            if player_name not in data:
+                yield event.plain_result(f"未找到玩家 '{player_name}' 的数据，请检查玩家名是否正确。")
+                return
+            
+            player_data = data[player_name]
+            
+            # 格式化时间
+            today_seconds = player_data.get('today_time', 0)
+            total_seconds = player_data.get('online_time', 0)
+            
+            today_hours = int(today_seconds // 3600)
+            today_minutes = int((today_seconds % 3600) // 60)
+            
+            total_hours = int(total_seconds // 3600)
+            total_minutes = int((total_seconds % 3600) // 60)
+            
+            # 格式化为中文时间
+            today_time_str = f"{today_hours}小时{today_minutes}分钟" if today_hours > 0 else f"{today_minutes}分钟"
+            total_time_str = f"{total_hours}小时{total_minutes}分钟" if total_hours > 0 else f"{total_minutes}分钟"
+            
+            # 在线状态
+            online_status = "🟢在线" if player_data.get('online', False) else "🔴离线"
+            
+            # 构建消息链
+            message_chain = []
+            
+            # 添加头像
+            avatar_url = player_data.get('avatar', '')
+            if avatar_url:
+                cached_avatar = self.get_cached_avatar(player_name, avatar_url)
+                message_chain.append(Comp.Image(file=cached_avatar))
+            
+            # 添加个人信息
+            player_info = f"👤 {player_name} {online_status}\n"
+            player_info += f"📅 今日在线: {today_time_str}\n"
+            player_info += f"⏰ 总累计: {total_time_str}"
+            
+            message_chain.append(Comp.Plain(player_info))
+            
+            yield event.chain_result(message_chain)
+        else:
+            yield event.plain_result("获取玩家数据失败，请检查API配置。")
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
