@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Read(//e/git_repository/AstrBot/data/plugins/**)"
+      "Read(//e/git_repository/AstrBot/data/plugins/**)",
+      "Read(//c/Users/19777/Desktop/**)",
+      "Read(//e/git_repository/AstrBot/astrbot/core/platform/**)"
     ],
     "deny": [],
     "ask": []

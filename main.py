@@ -9,6 +9,8 @@ import requests
 import time
 import re
 import random
+import json
+import asyncio
 import astrbot.api.message_components as Comp
 
 zzk_apikey = "yTOgiQlDc7o66hSRgH9Yl2FVWL0c3iUp6ftVSFxu3k1IFfgXGM68hqYupjFhjzks"
@@ -21,6 +23,13 @@ poke_resp_list = ["喵~", "我喜欢你~", "uwu", "(*╹▽╹*)", "猫猫飞扑
 
 deploy_list = ["1977741520", "1557758223"]
 op_list = ["1977741520", "1557758223"]
+
+# 监听的QQ群列表，用于消息转发
+forward_groups = ["1019115421"]
+
+# 玩家在线时间追踪
+player_playtime_tracker = {}  # {player_name: last_hour_count}
+polling_task = None
 
 add1reply = None
 add1count = 0
@@ -36,9 +45,90 @@ class MyPlugin(Star):
 
     def __init__(self, context: Context):
         super().__init__(context)
+        self.context = context  # 保存context用于后续发送消息
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+        # 启动玩家在线时间监控任务
+        global polling_task
+        if polling_task is None or polling_task.done():
+            polling_task = asyncio.create_task(self.start_playtime_monitoring())
+
+    async def start_playtime_monitoring(self):
+        """启动玩家在线时间监控"""
+        try:
+            while True:
+                await asyncio.sleep(3600)  # 每小时检查一次
+                await self.check_playtime_milestones()
+        except asyncio.CancelledError:
+            logger.info("玩家在线时间监控任务已取消")
+        except Exception as e:
+            logger.error(f"玩家在线时间监控任务出错: {e}")
+
+    async def check_playtime_milestones(self):
+        """检查玩家在线时间里程碑"""
+        global player_playtime_tracker
+
+        try:
+            response = await self.getPlayerRankData()
+            if response.status_code != 200:
+                return
+
+            data = response.json()
+
+            for player_name, player_data in data.items():
+                today_seconds = player_data.get('today_time', 0)
+                current_hours = int(today_seconds // 3600)
+
+                # 获取上次记录的小时数
+                last_hours = player_playtime_tracker.get(player_name, 0)
+
+                # 如果当前小时数大于上次记录，说明达到了新的整点小时
+                if current_hours > last_hours and current_hours > 0:
+                    # 更新记录
+                    player_playtime_tracker[player_name] = current_hours
+
+                    # 发送通知
+                    await self.send_playtime_notification(player_name, current_hours)
+
+                # 如果是新的一天，重置计数器
+                elif current_hours < last_hours:
+                    player_playtime_tracker[player_name] = current_hours
+
+        except Exception as e:
+            logger.error(f"检查玩家在线时间里程碑时出错: {e}")
+
+    async def send_playtime_notification(self, player_name: str, hours: int):
+        """发送玩家在线时间通知"""
+        message = f"{player_name}，又玩了一小时，别卷了！"
+
+        try:
+            # 发送到游戏服务器
+            tellraw_command = f'tellraw @a {json.dumps({"text": message, "color": "yellow"})}'
+            await self.sendZZKCommand(tellraw_command)
+
+            # 发送到监听的QQ群
+            from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember, MessageType
+            from astrbot.core.message.message_event_result import MessageEventResult
+
+            for group_id in forward_groups:
+                try:
+                    # 创建消息对象发送到群组
+                    # 通过平台管理器发送消息到指定群组
+                    platform_manager = self.context.get_cached_platforms()
+                    if platform_manager:
+                        for platform in platform_manager:
+                            # 尝试发送到群组
+                            message_chain = [Comp.Plain(message)]
+                            await platform.send_message(group_id, message_chain)
+                            break
+                except Exception as e:
+                    logger.error(f"发送到QQ群 {group_id} 失败: {e}")
+                    # fallback: 使用日志记录
+                    logger.info(f"[玩家小时提醒] 群{group_id}: {message}")
+
+        except Exception as e:
+            logger.error(f"发送玩家在线时间通知时出错: {e}")
         
     def get_cached_avatar(self, player_name, avatar_url):
         """获取缓存的头像，如果没有则下载并缓存"""
@@ -124,41 +214,79 @@ class MyPlugin(Star):
     async def on_all_message(self, event: AstrMessageEvent):
         chain = event.get_messages()
         sender = event.get_sender_id()
-        
+        group_id = str(event.message_obj.session_id)
+
         # 检查消息链是否为空，避免索引越界
         if not chain or len(chain) == 0:
             return
-            
+
+        # 消息转发功能：检查是否来自监听群组
+        if group_id in forward_groups:
+            # 过滤掉机器人自己发送的消息，避免无限循环
+            if sender == event.message_obj.self_id:
+                return
+
+            # 提取所有文本内容，处理At组件
+            message_parts = []
+            for msg in chain:
+                if msg.type == "Plain":
+                    message_parts.append(msg.toString())
+                elif msg.type == "At":
+                    # 将At组件转换为文本格式
+                    if hasattr(msg, 'qq'):
+                        message_parts.append(f"@{msg.qq}")
+                    else:
+                        message_parts.append("@某人")
+
+            # 如果有内容，则转发到服务器
+            if message_parts:
+                full_text = ''.join(message_parts).strip()
+                if full_text:  # 确保不是空消息
+                    # 获取发送者昵称
+                    sender_name = event.get_sender_name() or f"用户{sender}"
+
+                    # 构建tellraw指令，使用灰色文本，在昵称和消息间添加空格
+                    message_content = f"[{sender_name}] {full_text}"
+                    # 使用json.dumps确保特殊字符正确转义
+                    json_text = json.dumps({"text": message_content, "color": "gray"})
+                    tellraw_command = f'tellraw @a {json_text}'
+
+                    # 发送到服务器
+                    await self.sendZZKCommand(tellraw_command)
+                    # 使用空结果来阻止消息继续传播
+                    yield event.plain_result("")
+                    return
+
         if (chain[0].type == "Poke:poke" and chain[0].qq == int(event.message_obj.self_id)):
             random.seed(time.time())
             randint = random.randint(0, 4)
             yield event.plain_result(poke_resp_list[randint])
         else:
             for msg in chain:
-                str = msg.toString()
-                if (msg.type == "Plain" and ("现充" in str or "线虫" in str)):
+                msg_str = msg.toString()
+                if (msg.type == "Plain" and ("现充" in msg_str or "线虫" in msg_str)):
                     # 发送消息
                     yield event.plain_result("线虫☹☹☹☹捅死你喵捅死你喵")
                     return
-                if (msg.type == "Plain" and sender == "2627890758" and ("br" in str or "方块竞速" in str or "block race" in str or "block racing" in str)):
+                if (msg.type == "Plain" and sender == "2627890758" and ("br" in msg_str or "方块竞速" in msg_str or "block race" in msg_str or "block racing" in msg_str)):
                     # 发送消息
                     yield event.plain_result("br大师Na2PtCl6")
                     return
-                if (msg.type == "Plain" and ("🦌" in str or "吉吉" in str or "鹿" in str)):
+                if (msg.type == "Plain" and ("🦌" in msg_str or "吉吉" in msg_str or "鹿" in msg_str)):
                     # 发送消息
                     yield event.plain_result("🦌🦌🦌🦌🦌🦌🦌🦌🦌")
                     return
-                
+
             global add1reply, add1count
             # 确保chain不为空才进行后续处理
             if not chain:
                 return
-                
+
             if add1reply is None or len(chain) != len(add1reply):
                 add1reply = chain
                 add1count = 1
                 return
-            
+
             for idx, msg in enumerate(chain):
                 if (msg.type != add1reply[idx].type):
                     add1reply = chain
@@ -176,7 +304,7 @@ class MyPlugin(Star):
                     add1reply = chain
                     add1count = 1
                     return
-            
+
             add1count += 1
             if add1count == 3:
                     # 发送消息
@@ -786,5 +914,120 @@ class MyPlugin(Star):
         else:
             yield event.plain_result("获取玩家数据失败，请检查API配置。")
 
+    async def sendZZKCommand(self, command: str):
+        """向ZZK服务器发送指令"""
+        data = {
+            "rcon_info": {
+                "rcon_host": "127.0.0.1",
+                "rcon_password": "142857",
+                "rcon_port": 25575,
+            },
+            "command": command
+        }
+
+        headers = {
+            'x-api-key': zzk_apikey,
+            'Content-Type': 'application/json'
+        }
+
+        response = requests.post(zzk_baseURL + "/send_command", json=data, headers=headers)
+        return response
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def handleSayCommand(self, event: AstrMessageEvent):
+        """处理say指令"""
+        chain = event.get_messages()
+
+        if not chain or len(chain) == 0:
+            return
+
+        # 提取所有Plain文本内容，跳过At组件
+        text_parts = []
+        for msg in chain:
+            if msg.type == "Plain":
+                text_parts.append(msg.toString())
+
+        if not text_parts:
+            return
+
+        # 合并所有文本内容并去除多余空格
+        full_text = ' '.join(text_parts).strip()
+
+        if not full_text.startswith("say "):
+            return
+
+        # 提取say指令后的内容
+        say_content = full_text[4:]  # 移除"say "前缀
+
+        if not say_content:
+            yield event.plain_result("请提供要说的内容。")
+            return
+
+        # 构建minecraft say指令
+        minecraft_command = f'say "{say_content}"'
+
+        # 发送指令
+        response = await self.sendZZKCommand(minecraft_command)
+
+        if response.status_code == 200:
+            yield event.plain_result(f"成功在服务器发送消息：{say_content}")
+        elif response.status_code == 403:
+            response_data = response.json()
+            yield event.plain_result(f"发送失败：{response_data.get('message', '服务器错误')}")
+        else:
+            yield event.plain_result("发送失败，请检查服务器状态。")
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def handleCmdCommand(self, event: AstrMessageEvent):
+        """处理cmd指令"""
+        chain = event.get_messages()
+
+        if not chain or len(chain) == 0:
+            return
+
+        # 提取所有Plain文本内容，跳过At组件
+        text_parts = []
+        for msg in chain:
+            if msg.type == "Plain":
+                text_parts.append(msg.toString())
+
+        if not text_parts:
+            return
+
+        # 合并所有文本内容并去除多余空格
+        full_text = ' '.join(text_parts).strip()
+
+        if not full_text.startswith("cmd "):
+            return
+
+        if event.get_sender_id() not in deploy_list:
+            yield event.plain_result("你没有权限执行该操作。")
+            return
+
+        # 提取cmd指令后的内容
+        cmd_content = full_text[4:]  # 移除"cmd "前缀
+
+        if not cmd_content:
+            yield event.plain_result("请提供要执行的指令。")
+            return
+
+        # 发送指令
+        response = await self.sendZZKCommand(cmd_content)
+
+        if response.status_code == 200:
+            yield event.plain_result(f"成功执行指令：{cmd_content}")
+        elif response.status_code == 403:
+            response_data = response.json()
+            yield event.plain_result(f"执行失败：{response_data.get('message', '服务器错误')}")
+        else:
+            yield event.plain_result("执行失败，请检查服务器状态。")
+
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        global polling_task
+        if polling_task and not polling_task.done():
+            polling_task.cancel()
+            try:
+                await polling_task
+            except asyncio.CancelledError:
+                pass
